@@ -4,6 +4,7 @@ const qrcode = require('qrcode');
 const pino = require('pino');
 const path = require('path');
 const fs = require('fs');
+const { MongoClient } = require('mongodb');
 const {
     default: makeWASocket,
     useMultiFileAuthState,
@@ -14,6 +15,7 @@ const {
 const app = express();
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || 'attendance_wa_secret_key_2026';
+const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI || '';
 const AUTH_FOLDER = path.join(__dirname, 'auth_info_baileys');
 
 app.use(cors());
@@ -24,6 +26,98 @@ let qrCodeRaw = null;
 let qrCodeDataUrl = null;
 let connectionStatus = 'disconnected'; // 'disconnected' | 'connecting' | 'qr_ready' | 'connected'
 let connectedUser = null;
+let mongoDb = null;
+let syncTimeout = null;
+
+// Ensure auth folder exists
+if (!fs.existsSync(AUTH_FOLDER)) {
+    fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+}
+
+// ---------------- MongoDB Session Persistence ----------------
+async function initMongo() {
+    if (!MONGO_URI) {
+        console.log('ℹ️ No MONGO_URI provided. Running session in local file storage mode.');
+        return;
+    }
+    try {
+        const client = new MongoClient(MONGO_URI);
+        await client.connect();
+        mongoDb = client.db('attendance_wa');
+        console.log('🍃 MongoDB Atlas Connected! Cloud session sync active.');
+    } catch (err) {
+        console.error('⚠️ MongoDB Connection failed, falling back to local files:', err.message);
+    }
+}
+
+async function restoreAuthFromMongo() {
+    if (!mongoDb) return;
+    try {
+        const collection = mongoDb.collection('wa_auth_files');
+        const docs = await collection.find({}).toArray();
+        if (docs.length > 0) {
+            console.log(`📥 Restoring ${docs.length} session auth file(s) from MongoDB...`);
+            for (const doc of docs) {
+                const filePath = path.join(AUTH_FOLDER, doc._id);
+                fs.writeFileSync(filePath, Buffer.from(doc.data, 'base64'));
+            }
+            console.log('✅ Session restored from MongoDB Atlas successfully.');
+        }
+    } catch (err) {
+        console.error('Error restoring session from MongoDB:', err.message);
+    }
+}
+
+async function saveAuthToMongo() {
+    if (!mongoDb) return;
+    try {
+        if (!fs.existsSync(AUTH_FOLDER)) return;
+        const files = fs.readdirSync(AUTH_FOLDER);
+        if (files.length === 0) return;
+
+        const collection = mongoDb.collection('wa_auth_files');
+        const operations = [];
+
+        for (const file of files) {
+            const filePath = path.join(AUTH_FOLDER, file);
+            if (fs.statSync(filePath).isFile()) {
+                const content = fs.readFileSync(filePath).toString('base64');
+                operations.push({
+                    replaceOne: {
+                        filter: { _id: file },
+                        replacement: { _id: file, data: content, updatedAt: new Date() },
+                        upsert: true
+                    }
+                });
+            }
+        }
+
+        if (operations.length > 0) {
+            await collection.bulkWrite(operations);
+        }
+    } catch (err) {
+        console.error('Error saving session to MongoDB:', err.message);
+    }
+}
+
+function queueSaveAuthToMongo() {
+    if (!mongoDb) return;
+    if (syncTimeout) clearTimeout(syncTimeout);
+    syncTimeout = setTimeout(() => {
+        saveAuthToMongo();
+    }, 1500);
+}
+
+async function clearAuthFromMongo() {
+    if (!mongoDb) return;
+    try {
+        const collection = mongoDb.collection('wa_auth_files');
+        await collection.deleteMany({});
+        console.log('🗑️ MongoDB session data cleared.');
+    } catch (err) {
+        console.error('Error clearing MongoDB session:', err.message);
+    }
+}
 
 // Middleware to check API key for protected routes
 function requireAuth(req, res, next) {
@@ -36,6 +130,8 @@ function requireAuth(req, res, next) {
 
 async function connectToWhatsApp() {
     connectionStatus = 'connecting';
+    await restoreAuthFromMongo();
+
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
     const { version } = await fetchLatestBaileysVersion();
 
@@ -48,7 +144,10 @@ async function connectToWhatsApp() {
         syncFullHistory: false
     });
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', async () => {
+        await saveCreds();
+        queueSaveAuthToMongo();
+    });
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
@@ -75,10 +174,11 @@ async function connectToWhatsApp() {
             connectedUser = null;
 
             if (statusCode === DisconnectReason.loggedOut) {
-                // Clear session files if logged out
+                // Clear session files and MongoDB if logged out
                 try {
                     fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
                 } catch (e) {}
+                await clearAuthFromMongo();
             }
 
             if (shouldReconnect) {
@@ -90,6 +190,7 @@ async function connectToWhatsApp() {
             qrCodeRaw = null;
             qrCodeDataUrl = null;
             connectedUser = sock.user || null;
+            queueSaveAuthToMongo();
         }
     });
 }
@@ -100,6 +201,7 @@ app.get('/', (req, res) => {
         success: true,
         service: 'Attendance WhatsApp Gateway',
         status: connectionStatus,
+        mongo_backup: !!mongoDb,
         user: connectedUser ? { id: connectedUser.id, name: connectedUser.name } : null
     });
 });
@@ -110,6 +212,7 @@ app.get('/status', (req, res) => {
         success: true,
         status: connectionStatus,
         connected: connectionStatus === 'connected',
+        mongo_backup: !!mongoDb,
         user: connectedUser ? { id: connectedUser.id, name: connectedUser.name } : null,
         has_qr: !!qrCodeDataUrl
     });
@@ -197,9 +300,6 @@ app.post('/send-message', requireAuth, async (req, res) => {
     }
 
     try {
-        // Format destination JID:
-        // If it's already a full JID (e.g. 12036304xxx@g.us or 919876543210@s.whatsapp.net), keep it.
-        // Otherwise clean number and append @s.whatsapp.net
         let jid = to.trim();
         if (!jid.includes('@')) {
             const cleanNumber = jid.replace(/[^0-9]/g, '');
@@ -229,6 +329,7 @@ app.post('/logout', requireAuth, async (req, res) => {
         try {
             fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
         } catch (e) {}
+        await clearAuthFromMongo();
         
         connectionStatus = 'disconnected';
         qrCodeRaw = null;
@@ -244,7 +345,8 @@ app.post('/logout', requireAuth, async (req, res) => {
 });
 
 // Start Express and initiate Baileys
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
     console.log(`🚀 Attendance WhatsApp Gateway running on port ${PORT}`);
-    connectToWhatsApp();
+    await initMongo();
+    await connectToWhatsApp();
 });
