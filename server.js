@@ -293,10 +293,10 @@ app.post('/send-message', requireAuth, async (req, res) => {
         return res.status(400).json({ success: false, message: 'WhatsApp is not connected. Please scan QR in Admin portal.' });
     }
 
-    const { to, message } = req.body;
+    const { to, message, footer, templateButtons, buttons } = req.body;
 
-    if (!to || !message) {
-        return res.status(400).json({ success: false, message: 'Parameters "to" (phone/group ID) and "message" are required.' });
+    if (!to || (!message && !templateButtons && !buttons)) {
+        return res.status(400).json({ success: false, message: 'Parameters "to" and "message" are required.' });
     }
 
     try {
@@ -306,7 +306,15 @@ app.post('/send-message', requireAuth, async (req, res) => {
             jid = `${cleanNumber}@s.whatsapp.net`;
         }
 
-        const sent = await sock.sendMessage(jid, { text: message });
+        const msgPayload = { text: message || '' };
+        if (footer) msgPayload.footer = footer;
+        if (Array.isArray(templateButtons) && templateButtons.length > 0) {
+            msgPayload.templateButtons = templateButtons;
+        } else if (Array.isArray(buttons) && buttons.length > 0) {
+            msgPayload.buttons = buttons;
+        }
+
+        const sent = await sock.sendMessage(jid, msgPayload);
 
         res.json({
             success: true,
